@@ -1,0 +1,30 @@
+{
+  "name": "@eveng2-remote/glass",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "npm run build -w @eveng2-remote/protocol",
+    "dev": "vite",
+    "prebuild": "npm run build -w @eveng2-remote/protocol",
+    "build": "tsc --noEmit && vite build",
+    "pretypecheck": "npm run build -w @eveng2-remote/protocol",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "pack": "npm run build && evenhub pack app.json dist -o eveng2-remote.ehpk",
+    "simulate": "evenhub-simulator http://localhost:5173",
+    "pretest": "npm run build -w @eveng2-remote/protocol",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "^0.0.10",
+    "@eveng2-remote/protocol": "0.1.0"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "^0.1.12",
+    "@evenrealities/evenhub-simulator": "^0.7.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.2.1"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@eveng2-remote/bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "npm run build -w @eveng2-remote/protocol",
+    "dev": "tsx watch src/index.ts",
+    "prebuild": "npm run build -w @eveng2-remote/protocol",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "pretypecheck": "npm run build -w @eveng2-remote/protocol",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "pretest": "npm run build -w @eveng2-remote/protocol",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@eveng2-remote/protocol": "0.1.0",
+    "dotenv": "^16.4.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.7.0"
+  }
+}

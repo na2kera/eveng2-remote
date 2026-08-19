@@ -1,0 +1,21 @@
+{
+  "name": "eveng2-remote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @eveng2-remote/protocol && npm run build -w @eveng2-remote/bridge && npm run build -w @eveng2-remote/glass",
+    "typecheck": "npm run typecheck -ws --if-present",
+    "test": "npm run test -ws --if-present",
+    "dev:bridge": "npm run dev -w @eveng2-remote/bridge",
+    "dev:glass": "npm run dev -w @eveng2-remote/glass",
+    "pack:glass": "npm run pack -w @eveng2-remote/glass"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}
