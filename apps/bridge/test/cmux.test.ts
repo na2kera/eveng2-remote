@@ -8,7 +8,7 @@ test('pastes exact text through a dedicated buffer and clears it after submittin
     calls.push({ binary, args })
   }
   const cmux = new CmuxClient(
-    { binary: '/bin/cmux', allowInput: 'y', denyInput: 'n', defaultSurface: 'surface:1' },
+    { binary: '/bin/cmux', defaultSurface: 'surface:1' },
     runner,
   )
 
@@ -37,21 +37,10 @@ test('pastes exact text through a dedicated buffer and clears it after submittin
   ])
 })
 
-test('uses configurable permission inputs', async () => {
-  const calls: string[][] = []
-  const cmux = new CmuxClient(
-    { binary: 'cmux', allowInput: '1', denyInput: '3', defaultWorkspace: 'workspace:2' },
-    async (_binary, args) => void calls.push(args),
-  )
-
-  await cmux.respondToPermission({}, 'deny')
-  assert.deepEqual(calls, [['send', '--workspace', 'workspace:2', '3']])
-})
-
 test('clears the dedicated buffer even when Enter fails', async () => {
   const calls: string[][] = []
   const cmux = new CmuxClient(
-    { binary: 'cmux', allowInput: 'y', denyInput: 'n', defaultSurface: 'surface:1' },
+    { binary: 'cmux', defaultSurface: 'surface:1' },
     async (_binary, args) => {
       calls.push(args)
       if (args[0] === 'send-key') throw new Error('socket closed')

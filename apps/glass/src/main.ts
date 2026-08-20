@@ -8,7 +8,12 @@ import {
 import type { PermissionRequest, ServerMessage } from '@eveng2-remote/protocol'
 import { eventTypeOf } from './input'
 import { RemoteClient, type RemoteConnectionState } from './remote'
-import { mountUi, renderUi, type UiView } from './ui'
+import {
+  GLASSES_PERMISSION_REVIEW_CHARS,
+  GLASSES_TRANSCRIPT_REVIEW_CHARS,
+  requiresCompanionReview,
+} from './security'
+import { mountUi, pairingTokenValue, renderUi, type UiView } from './ui'
 
 type HubBridge = Awaited<ReturnType<typeof waitForEvenAppBridge>>
 
@@ -30,6 +35,7 @@ type RecoverableState = { kind: 'idle' } | PermissionState | TranscriptState
 
 type AppState =
   | { kind: 'booting' }
+  | { kind: 'pairing'; error?: string }
   | { kind: 'connecting' }
   | { kind: 'disconnected' }
   | { kind: 'idle' }
@@ -54,6 +60,7 @@ let unsubscribeHub = () => {}
 let permissionQueue: PermissionRequest[] = []
 let successTimer: number | null = null
 let cleanedUp = false
+let configuredBridgeUrl = ''
 
 mountUi({
   onPrimary: () => {
@@ -121,16 +128,26 @@ async function start(): Promise<void> {
   })
 
   const bridgeUrl = import.meta.env.VITE_BRIDGE_URL?.trim()
-  const bridgeToken = import.meta.env.VITE_BRIDGE_TOKEN?.trim()
-  if (!bridgeUrl || !bridgeToken) {
-    showError('VITE_BRIDGE_URL and VITE_BRIDGE_TOKEN must be configured.', { kind: 'idle' })
+  if (!bridgeUrl) {
+    showError('VITE_BRIDGE_URL must be configured.', { kind: 'idle' })
+    return
+  }
+  configuredBridgeUrl = bridgeUrl
+  const bridgeToken = loadPairingToken()
+  if (!bridgeToken) {
+    state = { kind: 'pairing' }
+    renderAll()
     return
   }
 
+  connectRemote(bridgeToken)
+}
+
+function connectRemote(bridgeToken: string): void {
   state = { kind: 'connecting' }
   renderAll()
   remote = new RemoteClient({
-    url: bridgeUrl,
+    url: configuredBridgeUrl,
     token: bridgeToken,
     clientId: loadClientId(),
     onStatus: handleRemoteStatus,
@@ -185,7 +202,7 @@ async function handleRemoteMessage(message: ServerMessage): Promise<void> {
           sessionId: message.sessionId,
           transcriptId: message.transcriptId,
           text: message.text,
-          selection: 'send',
+          selection: requiresCompanionReview(message.text, GLASSES_TRANSCRIPT_REVIEW_CHARS) ? 'retry' : 'send',
         }
         renderAll()
       }
@@ -237,6 +254,10 @@ async function handleGlassTap(): Promise<void> {
 }
 
 async function handleWebPrimary(): Promise<void> {
+  if (state.kind === 'pairing') {
+    submitPairingToken()
+    return
+  }
   if (state.kind === 'permission') {
     respondToPermission('allow')
     return
@@ -248,7 +269,26 @@ async function handleWebPrimary(): Promise<void> {
   await handleGlassTap()
 }
 
+function submitPairingToken(): void {
+  const token = pairingTokenValue()
+  if (token.length < 32) {
+    state = { kind: 'pairing', error: 'Pairing token must be at least 32 characters.' }
+    renderAll()
+    return
+  }
+  try {
+    window.sessionStorage.setItem('eveng2-remote-client-token', token)
+  } catch {
+    // The in-memory connection still works when session storage is unavailable.
+  }
+  connectRemote(token)
+}
+
 async function handleWebSecondary(): Promise<void> {
+  if (state.kind === 'disconnected') {
+    resetPairing()
+    return
+  }
   if (state.kind === 'permission') {
     respondToPermission('deny')
     return
@@ -260,6 +300,18 @@ async function handleWebSecondary(): Promise<void> {
   if (state.kind === 'error') {
     restoreFromError(state.recover)
   }
+}
+
+function resetPairing(): void {
+  remote?.close()
+  remote = null
+  try {
+    window.sessionStorage.removeItem('eveng2-remote-client-token')
+  } catch {
+    // Continue with the in-memory reset when session storage is unavailable.
+  }
+  state = { kind: 'pairing' }
+  renderAll()
 }
 
 function startRecording(): void {
@@ -421,9 +473,11 @@ function restoreFromError(recover: RecoverableState): void {
 
 function toggleSelection(): void {
   if (state.kind === 'permission') {
+    if (requiresCompanionReview(state.request.summary, GLASSES_PERMISSION_REVIEW_CHARS)) return
     state = { ...state, selection: state.selection === 'allow' ? 'deny' : 'allow' }
     renderAll()
   } else if (state.kind === 'transcript') {
+    if (requiresCompanionReview(state.text, GLASSES_TRANSCRIPT_REVIEW_CHARS)) return
     state = { ...state, selection: state.selection === 'send' ? 'retry' : 'send' }
     renderAll()
   }
@@ -438,10 +492,32 @@ function uiViewFor(current: AppState): UiView {
   switch (current.kind) {
     case 'booting':
       return view('BOOTING', 'neutral', 'EVEN HUB', 'G2 を初期化中', 'SDK bridge の準備を待っています。', '')
+    case 'pairing':
+      return {
+        ...view(
+          'PAIRING',
+          'warning',
+          'SECURE LINK',
+          'Bridge とペアリング',
+          current.error ?? 'BridgeのBRIDGE_CLIENT_TOKENを入力してください。トークンはこのセッション内だけに保存されます。',
+          'スマホ側で入力してください',
+          '接続',
+        ),
+        pairing: true,
+      }
     case 'connecting':
       return view('LINKING', 'neutral', 'LOCAL LINK', 'Mac Bridge に接続中', 'WebSocket セッションを同期しています。', '自動的に再接続します')
     case 'disconnected':
-      return view('OFFLINE', 'danger', 'LOCAL LINK', 'Bridge がオフラインです', 'Mac の Bridge と同じ LAN にいるか確認してください。', '再接続を試行中')
+      return view(
+        'OFFLINE',
+        'danger',
+        'LOCAL LINK',
+        'Bridge がオフラインです',
+        'Mac の Bridge と同じ LAN にいるか、tokenが正しいか確認してください。',
+        '再接続を試行中',
+        undefined,
+        '再ペアリング',
+      )
     case 'idle':
       return view('READY', 'live', 'VOICE CHANNEL', '指示を録音できます', 'G2 のテンプルをタップするか、下のボタンから録音を開始します。', 'ダブルタップで終了', '録音開始')
     case 'permission':
@@ -498,6 +574,8 @@ function glassesTextFor(current: AppState): string {
   switch (current.kind) {
     case 'booting':
       return 'G2 REMOTE\n\nStarting...'
+    case 'pairing':
+      return 'G2 REMOTE / PAIRING\n\nEnter the client token on the phone.'
     case 'connecting':
       return 'G2 REMOTE\n\nConnecting to Mac...'
     case 'disconnected':
@@ -505,8 +583,11 @@ function glassesTextFor(current: AppState): string {
     case 'idle':
       return 'G2 REMOTE / READY\n\nTap to record a voice command.\n\nDouble-tap to exit.'
     case 'permission': {
+      if (requiresCompanionReview(current.request.summary, GLASSES_PERMISSION_REVIEW_CHARS)) {
+        return `PERMISSION REQUIRED\n\n${clip(current.request.toolName, 80)}\n${clip(current.request.summary, GLASSES_PERMISSION_REVIEW_CHARS)}\n\nPHONE REVIEW REQUIRED\nTap: deny`
+      }
       const choices = current.selection === 'allow' ? '[ALLOW]   DENY' : ' ALLOW   [DENY]'
-      return `PERMISSION REQUIRED\n\n${clip(current.request.toolName, 80)}\n${clip(current.request.summary, 300)}\n\n${choices}\nSwipe: select / Tap: confirm`
+      return `PERMISSION REQUIRED\n\n${clip(current.request.toolName, 80)}\n${clip(current.request.summary, GLASSES_PERMISSION_REVIEW_CHARS)}\n\n${choices}\nSwipe: select / Tap: confirm`
     }
     case 'starting-recording':
       return 'VOICE COMMAND\n\nOpening microphone...'
@@ -515,8 +596,11 @@ function glassesTextFor(current: AppState): string {
     case 'transcribing':
       return 'LOCAL WHISPER\n\nTranscribing...\n\nYou will review before send.'
     case 'transcript': {
+      if (requiresCompanionReview(current.text, GLASSES_TRANSCRIPT_REVIEW_CHARS)) {
+        return `REVIEW TRANSCRIPT\n\n${clip(current.text, GLASSES_TRANSCRIPT_REVIEW_CHARS)}\n\nPHONE REVIEW REQUIRED\nTap: retry`
+      }
       const choices = current.selection === 'send' ? '[SEND]   RETRY' : ' SEND   [RETRY]'
-      return `REVIEW TRANSCRIPT\n\n${clip(current.text, 360)}\n\n${choices}\nSwipe: select / Tap: confirm`
+      return `REVIEW TRANSCRIPT\n\n${clip(current.text, GLASSES_TRANSCRIPT_REVIEW_CHARS)}\n\n${choices}\nSwipe: select / Tap: confirm`
     }
     case 'busy':
       return 'G2 REMOTE\n\nSending to cmux...'
@@ -584,6 +668,14 @@ function loadClientId(): string {
     return created
   } catch {
     return createId()
+  }
+}
+
+function loadPairingToken(): string | undefined {
+  try {
+    return window.sessionStorage.getItem('eveng2-remote-client-token')?.trim() || undefined
+  } catch {
+    return undefined
   }
 }
 

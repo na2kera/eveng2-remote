@@ -28,6 +28,7 @@ export interface ClientHelloMessage {
   type: 'client.hello'
   protocolVersion: typeof PROTOCOL_VERSION
   clientId: string
+  token: string
 }
 
 export interface PermissionResponseMessage {
@@ -39,7 +40,6 @@ export interface PermissionResponseMessage {
 export interface AudioStartMessage {
   type: 'audio.start'
   sessionId: string
-  target?: CmuxTarget
 }
 
 export interface AudioStopMessage {
@@ -172,7 +172,9 @@ export function parseClientMessage(input: string): ParseResult<ClientMessage> {
 
   switch (value.type) {
     case 'client.hello':
-      return value.protocolVersion === PROTOCOL_VERSION && isNonEmptyString(value.clientId, 160)
+      return value.protocolVersion === PROTOCOL_VERSION &&
+        isNonEmptyString(value.clientId, 160) &&
+        isNonEmptyString(value.token, 512)
         ? { ok: true, value: value as unknown as ClientHelloMessage }
         : { ok: false, error: 'Invalid client.hello message.' }
     case 'permission.response':
@@ -180,7 +182,7 @@ export function parseClientMessage(input: string): ParseResult<ClientMessage> {
         ? { ok: true, value: value as unknown as PermissionResponseMessage }
         : { ok: false, error: 'Invalid permission.response message.' }
     case 'audio.start':
-      return isNonEmptyString(value.sessionId, 160) && (value.target === undefined || isTarget(value.target))
+      return isNonEmptyString(value.sessionId, 160) && value.target === undefined
         ? { ok: true, value: value as unknown as AudioStartMessage }
         : { ok: false, error: 'Invalid audio.start message.' }
     case 'audio.stop':

@@ -11,9 +11,9 @@ import {
 
 test('client messages round-trip through the validator', () => {
   const messages: ClientMessage[] = [
-    { type: 'client.hello', protocolVersion: PROTOCOL_VERSION, clientId: 'glass-1' },
+    { type: 'client.hello', protocolVersion: PROTOCOL_VERSION, clientId: 'glass-1', token: 'client-token' },
     { type: 'permission.response', requestId: 'request-1', decision: 'allow' },
-    { type: 'audio.start', sessionId: 'audio-1', target: { surfaceId: 'surface:1' } },
+    { type: 'audio.start', sessionId: 'audio-1' },
     { type: 'audio.stop', sessionId: 'audio-1' },
     { type: 'audio.cancel', sessionId: 'audio-1' },
     { type: 'transcript.action', transcriptId: 'transcript-1', action: 'send' },
@@ -22,6 +22,10 @@ test('client messages round-trip through the validator', () => {
   for (const message of messages) {
     assert.deepEqual(parseClientMessage(encodeMessage(message)), { ok: true, value: message })
   }
+  assert.equal(
+    parseClientMessage(JSON.stringify({ type: 'audio.start', sessionId: 'audio-1', target: { surfaceId: 'x' } })).ok,
+    false,
+  )
 })
 
 test('server messages reject malformed payloads', () => {
