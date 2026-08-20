@@ -21,6 +21,7 @@ test('sends WAV multipart fields and normalizes whisper text to one line', async
     language: 'ja',
     prompt: 'TypeScript, cmux',
     timeoutMs: 1_000,
+    maxResponseBytes: 64 * 1024,
   })
   const transcript = await client.transcribe(Uint8Array.from([1, 2, 3, 4]))
 
@@ -46,6 +47,24 @@ test('rejects an empty transcript', async t => {
     language: 'ja',
     prompt: '',
     timeoutMs: 1_000,
+    maxResponseBytes: 64 * 1024,
   })
   await assert.rejects(() => client.transcribe(Uint8Array.from([1, 2])), /empty transcript/)
+})
+
+test('rejects a whisper response larger than the configured limit', async t => {
+  const originalFetch = globalThis.fetch
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+  globalThis.fetch = (async () => new Response(JSON.stringify({ text: 'too large' }), { status: 200 })) as typeof fetch
+
+  const client = new WhisperClient({
+    url: 'http://127.0.0.1:8080/inference',
+    language: 'ja',
+    prompt: '',
+    timeoutMs: 1_000,
+    maxResponseBytes: 4,
+  })
+  await assert.rejects(() => client.transcribe(Uint8Array.from([1, 2])), /response exceeds 4 bytes/)
 })

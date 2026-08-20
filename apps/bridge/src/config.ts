@@ -3,17 +3,22 @@ import { PCM_BITS_PER_SAMPLE, PCM_CHANNELS, PCM_SAMPLE_RATE } from '@eveng2-remo
 export interface BridgeConfig {
   host: string
   port: number
-  token: string
+  clientToken: string
+  hookToken: string
+  tlsCertPath?: string
+  tlsKeyPath?: string
   whisperUrl: string
   whisperLanguage: string
   whisperPrompt: string
   whisperTimeoutMs: number
+  maxWhisperResponseBytes: number
   maxRecordingBytes: number
+  maxClients: number
+  maxPendingPermissions: number
+  maxConcurrentTranscriptions: number
   cmuxBin: string
   cmuxDefaultSurface?: string
   cmuxDefaultWorkspace?: string
-  cmuxAllowInput: string
-  cmuxDenyInput: string
   permissionTtlMs: number
   maxHookBodyBytes: number
 }
@@ -39,29 +44,53 @@ function optional(name: string): string | undefined {
 }
 
 export function loadConfig(): BridgeConfig {
-  const token = required('BRIDGE_TOKEN')
-  if (token.length < 16) throw new Error('BRIDGE_TOKEN must be at least 16 characters.')
+  const clientToken = required('BRIDGE_CLIENT_TOKEN')
+  const hookToken = required('BRIDGE_HOOK_TOKEN')
+  if (clientToken.length < 32) throw new Error('BRIDGE_CLIENT_TOKEN must be at least 32 characters.')
+  if (hookToken.length < 32) throw new Error('BRIDGE_HOOK_TOKEN must be at least 32 characters.')
+  if (clientToken.length > 512) throw new Error('BRIDGE_CLIENT_TOKEN must not exceed 512 characters.')
+  if (hookToken.length > 512) throw new Error('BRIDGE_HOOK_TOKEN must not exceed 512 characters.')
+  if (clientToken === hookToken) throw new Error('BRIDGE_CLIENT_TOKEN and BRIDGE_HOOK_TOKEN must differ.')
+
+  const host = process.env.BRIDGE_HOST?.trim() || '127.0.0.1'
+  const tlsCertPath = optional('BRIDGE_TLS_CERT_PATH')
+  const tlsKeyPath = optional('BRIDGE_TLS_KEY_PATH')
+  if (Boolean(tlsCertPath) !== Boolean(tlsKeyPath)) {
+    throw new Error('BRIDGE_TLS_CERT_PATH and BRIDGE_TLS_KEY_PATH must be configured together.')
+  }
+  if (!isLoopbackHost(host) && !tlsCertPath) {
+    throw new Error('TLS certificate and key are required when BRIDGE_HOST is not loopback.')
+  }
 
   const maxRecordingSeconds = positiveInteger('MAX_RECORDING_SECONDS', 30, 300)
   const bytesPerSecond = PCM_SAMPLE_RATE * PCM_CHANNELS * (PCM_BITS_PER_SAMPLE / 8)
 
   return {
-    host: process.env.BRIDGE_HOST?.trim() || '0.0.0.0',
+    host,
     port: positiveInteger('BRIDGE_PORT', 8787, 65_535),
-    token,
+    clientToken,
+    hookToken,
+    tlsCertPath,
+    tlsKeyPath,
     whisperUrl: process.env.WHISPER_URL?.trim() || 'http://127.0.0.1:8080/inference',
     whisperLanguage: process.env.WHISPER_LANGUAGE?.trim() || 'ja',
     whisperPrompt:
       process.env.WHISPER_PROMPT?.trim() ||
       'Claude Code, Codex, cmux, TypeScript, Vite, useEffect, package.json, npm',
     whisperTimeoutMs: positiveInteger('WHISPER_TIMEOUT_MS', 120_000, 600_000),
+    maxWhisperResponseBytes: positiveInteger('MAX_WHISPER_RESPONSE_BYTES', 64 * 1024, 1024 * 1024),
     maxRecordingBytes: maxRecordingSeconds * bytesPerSecond,
+    maxClients: positiveInteger('MAX_CLIENTS', 4, 32),
+    maxPendingPermissions: positiveInteger('MAX_PENDING_PERMISSIONS', 32, 256),
+    maxConcurrentTranscriptions: positiveInteger('MAX_CONCURRENT_TRANSCRIPTIONS', 1, 8),
     cmuxBin: process.env.CMUX_BIN?.trim() || 'cmux',
     cmuxDefaultSurface: optional('CMUX_DEFAULT_SURFACE'),
     cmuxDefaultWorkspace: optional('CMUX_DEFAULT_WORKSPACE'),
-    cmuxAllowInput: process.env.CMUX_ALLOW_INPUT || 'y',
-    cmuxDenyInput: process.env.CMUX_DENY_INPUT || 'n',
-    permissionTtlMs: positiveInteger('PERMISSION_TTL_MS', 10 * 60_000, 24 * 60 * 60_000),
+    permissionTtlMs: positiveInteger('PERMISSION_TTL_MS', 60_000, 5 * 60_000),
     maxHookBodyBytes: positiveInteger('MAX_HOOK_BODY_BYTES', 256 * 1024, 4 * 1024 * 1024),
   }
+}
+
+function isLoopbackHost(host: string): boolean {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost'
 }

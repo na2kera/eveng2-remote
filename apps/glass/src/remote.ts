@@ -5,6 +5,7 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from '@eveng2-remote/protocol'
+import { parseBridgeUrl } from './security'
 
 export type RemoteConnectionState = 'connecting' | 'connected' | 'disconnected'
 
@@ -64,9 +65,7 @@ export class RemoteClient {
 
     let socket: WebSocket
     try {
-      const url = new URL(this.options.url)
-      if (url.protocol !== 'ws:' && url.protocol !== 'wss:') throw new Error('URL must use ws:// or wss://.')
-      url.searchParams.set('token', this.options.token)
+      const url = parseBridgeUrl(this.options.url)
       socket = new WebSocket(url)
     } catch (error) {
       this.options.onProtocolError(error instanceof Error ? error.message : String(error))
@@ -84,6 +83,7 @@ export class RemoteClient {
         type: 'client.hello',
         protocolVersion: PROTOCOL_VERSION,
         clientId: this.options.clientId,
+        token: this.options.token,
       })
     })
     socket.addEventListener('message', event => {

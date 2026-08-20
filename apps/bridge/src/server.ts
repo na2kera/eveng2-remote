@@ -1,5 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import {
   PROTOCOL_VERSION,
   encodeMessage,
@@ -22,7 +24,10 @@ const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024
 interface PendingPermission {
   request: PermissionRequest
   processing: boolean
+  settle(result: PermissionResult): void
 }
+
+type PermissionResult = 'allow' | 'deny' | 'expired' | 'cancelled'
 
 interface Recording {
   sessionId: string
@@ -38,6 +43,7 @@ interface StoredTranscript {
   target: CmuxTarget
   createdAt: number
   processing: boolean
+  owner: WebSocket
 }
 
 export interface BridgeDependencies {
@@ -55,26 +61,41 @@ export interface BridgeRuntime {
 
 export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDependencies): BridgeRuntime {
   const log = dependencies.log ?? console
+  const connections = new Set<WebSocket>()
   const clients = new Set<WebSocket>()
   const alive = new WeakMap<WebSocket, boolean>()
+  const initializedClients = new WeakSet<WebSocket>()
+  const authenticationTimers = new WeakMap<WebSocket, NodeJS.Timeout>()
   const recordings = new Map<WebSocket, Recording>()
   const pendingPermissions = new Map<string, PendingPermission>()
   const transcripts = new Map<string, StoredTranscript>()
   let lastTarget: CmuxTarget = {}
+  let activeTranscriptions = 0
 
-  const server = createServer((request, response) => {
+  const requestHandler = (request: IncomingMessage, response: ServerResponse) => {
     void handleHttp(request, response).catch(error => {
       log.error('HTTP handler failed:', error)
       if (!response.headersSent) writeJson(response, 500, { error: 'Internal server error.' })
       else response.end()
     })
-  })
+  }
+  const server = config.tlsCertPath && config.tlsKeyPath
+    ? createHttpsServer(
+        { cert: readFileSync(config.tlsCertPath), key: readFileSync(config.tlsKeyPath) },
+        requestHandler,
+      )
+    : createHttpServer(requestHandler)
   const webSockets = new WebSocketServer({ noServer: true, maxPayload: config.maxRecordingBytes })
 
   server.on('upgrade', (request, socket, head) => {
     const url = new URL(request.url ?? '/', 'http://bridge.local')
-    if (url.pathname !== '/ws' || !tokenMatches(url.searchParams.get('token'), config.token)) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+    if (url.pathname !== '/ws') {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
+      socket.destroy()
+      return
+    }
+    if (connections.size >= config.maxClients) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
       socket.destroy()
       return
     }
@@ -82,11 +103,16 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
   })
 
   webSockets.on('connection', socket => {
-    clients.add(socket)
+    connections.add(socket)
     alive.set(socket, true)
+    const authenticationTimer = setTimeout(() => socket.close(1008, 'Authentication timeout'), 5_000)
+    authenticationTimer.unref()
+    authenticationTimers.set(socket, authenticationTimer)
     socket.on('pong', () => alive.set(socket, true))
     socket.on('error', error => log.warn('WebSocket client error:', error))
     socket.on('close', () => {
+      clearTimeout(authenticationTimers.get(socket))
+      connections.delete(socket)
       clients.delete(socket)
       recordings.delete(socket)
     })
@@ -97,24 +123,17 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
       })
     })
 
-    send(socket, {
-      type: 'server.hello',
-      protocolVersion: PROTOCOL_VERSION,
-      pendingPermissions: [...pendingPermissions.values()]
-        .map(item => item.request)
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
-    })
   })
 
   const maintenanceTimer = setInterval(() => {
     const now = Date.now()
     for (const [id, item] of pendingPermissions) {
-      if (now - Date.parse(item.request.createdAt) > config.permissionTtlMs) pendingPermissions.delete(id)
+      if (permissionExpired(item.request, now, config.permissionTtlMs)) settlePermission(id, item, 'expired')
     }
     for (const [id, transcript] of transcripts) {
       if (now - transcript.createdAt > config.permissionTtlMs) transcripts.delete(id)
     }
-    for (const client of clients) {
+    for (const client of connections) {
       if (alive.get(client) === false) {
         client.terminate()
         continue
@@ -138,7 +157,7 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
     }
 
     if (request.method === 'POST' && isHookPath(url.pathname)) {
-      if (!requestIsAuthorized(request, config.token)) {
+      if (!requestIsAuthorized(request, config.hookToken)) {
         writeJson(response, 401, { error: 'Unauthorized.' })
         return
       }
@@ -169,10 +188,35 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
         return
       }
 
-      pendingPermissions.set(permission.id, { request: permission, processing: false })
-      if (permission.target.surfaceId || permission.target.workspaceId) lastTarget = permission.target
+      if (pendingPermissions.size >= config.maxPendingPermissions) {
+        writeJson(response, 429, { error: 'Too many permission requests are pending.' })
+        return
+      }
+
+      let settle!: (result: PermissionResult) => void
+      const resultPromise = new Promise<PermissionResult>(resolve => {
+        let settled = false
+        settle = result => {
+          if (settled) return
+          settled = true
+          resolve(result)
+        }
+      })
+      const pending: PendingPermission = { request: permission, processing: false, settle }
+      pendingPermissions.set(permission.id, pending)
       broadcast({ type: 'permission.request', request: permission })
-      writeJson(response, 202, { accepted: true, requestId: permission.id, connectedClients: clients.size })
+      response.once('close', () => {
+        if (!response.writableEnded) settlePermission(permission.id, pending, 'cancelled')
+      })
+      const result = await resultPromise
+      if (response.destroyed) return
+      if (result === 'allow' || result === 'deny') {
+        writeJson(response, 200, { decision: result, requestId: permission.id })
+      } else if (result === 'expired') {
+        writeJson(response, 408, { error: 'Permission request expired.', requestId: permission.id })
+      } else {
+        writeJson(response, 503, { error: 'Permission request was cancelled.', requestId: permission.id })
+      }
       return
     }
 
@@ -181,6 +225,11 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
 
   async function handleWebSocketMessage(socket: WebSocket, data: RawData, isBinary: boolean): Promise<void> {
     if (isBinary) {
+      if (!initializedClients.has(socket)) {
+        sendError(socket, 'hello_required', 'Authenticate with client.hello before other messages.', false)
+        socket.close(1008, 'client.hello required')
+        return
+      }
       handleAudioChunk(socket, data)
       return
     }
@@ -199,9 +248,31 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
   }
 
   async function handleClientMessage(socket: WebSocket, message: ClientMessage): Promise<void> {
-    switch (message.type) {
-      case 'client.hello':
+    if (message.type === 'client.hello') {
+      if (!tokenMatches(message.token, config.clientToken)) {
+        sendError(socket, 'unauthorized', 'Client authentication failed.', false)
+        socket.close(1008, 'Authentication failed')
         return
+      }
+      clearTimeout(authenticationTimers.get(socket))
+      initializedClients.add(socket)
+      clients.add(socket)
+      send(socket, {
+        type: 'server.hello',
+        protocolVersion: PROTOCOL_VERSION,
+        pendingPermissions: [...pendingPermissions.values()]
+          .map(item => item.request)
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+      })
+      return
+    }
+    if (!initializedClients.has(socket)) {
+      sendError(socket, 'hello_required', 'Send a valid client.hello before other messages.', false)
+      socket.close(1008, 'client.hello required')
+      return
+    }
+
+    switch (message.type) {
       case 'permission.response':
         await respondToPermission(socket, message.requestId, message.decision)
         return
@@ -212,7 +283,7 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
         }
         let target: CmuxTarget
         try {
-          target = dependencies.cmux.resolveTarget(hasTarget(message.target) ? message.target : lastTarget)
+          target = dependencies.cmux.resolveTarget(lastTarget)
         } catch (error) {
           sendError(socket, 'target_required', errorMessage(error), true, message.sessionId)
           return
@@ -264,13 +335,21 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
       return
     }
 
+    if (activeTranscriptions >= config.maxConcurrentTranscriptions) {
+      sendError(socket, 'transcription_busy', 'The transcription queue is full. Try again shortly.', true, sessionId)
+      return
+    }
+
     send(socket, { type: 'transcription.started', sessionId })
     let text: string
+    activeTranscriptions += 1
     try {
       text = await dependencies.transcriber.transcribe(Buffer.concat(recording.chunks, recording.totalBytes))
     } catch (error) {
       sendError(socket, 'transcription_failed', errorMessage(error), true, sessionId)
       return
+    } finally {
+      activeTranscriptions -= 1
     }
 
     const transcriptId = randomUUID()
@@ -281,6 +360,7 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
       target: recording.target,
       createdAt: Date.now(),
       processing: false,
+      owner: socket,
     })
     send(socket, { type: 'transcript.result', sessionId, transcriptId, text, target: recording.target })
   }
@@ -292,6 +372,10 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
   ): Promise<void> {
     const transcript = transcripts.get(transcriptId)
     if (!transcript) {
+      sendError(socket, 'transcript_not_found', 'Transcript expired or does not exist.', true, transcriptId)
+      return
+    }
+    if (transcript.owner !== socket) {
       sendError(socket, 'transcript_not_found', 'Transcript expired or does not exist.', true, transcriptId)
       return
     }
@@ -337,35 +421,40 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
       sendError(socket, 'permission_not_found', 'Permission request expired or does not exist.', true, requestId)
       return
     }
+    if (permissionExpired(pending.request, Date.now(), config.permissionTtlMs)) {
+      settlePermission(requestId, pending, 'expired')
+      sendError(socket, 'permission_not_found', 'Permission request expired or does not exist.', true, requestId)
+      return
+    }
     if (pending.processing) {
       sendError(socket, 'action_in_progress', 'This permission is already being processed.', true, requestId)
       return
     }
     pending.processing = true
-    try {
-      const target = dependencies.cmux.resolveTarget(pending.request.target)
-      await dependencies.cmux.respondToPermission(target, decision)
-      pendingPermissions.delete(requestId)
-      lastTarget = target
-      broadcast({
-        type: 'action.completed',
-        action: 'permission',
-        requestId,
-        message: decision === 'allow' ? 'Permission allowed.' : 'Permission denied.',
-      })
-    } catch (error) {
-      pending.processing = false
-      sendError(socket, 'cmux_send_failed', errorMessage(error), true, requestId)
-    }
+    if (pending.request.target.surfaceId || pending.request.target.workspaceId) lastTarget = pending.request.target
+    settlePermission(requestId, pending, decision)
+    broadcast({
+      type: 'action.completed',
+      action: 'permission',
+      requestId,
+      message: decision === 'allow' ? 'Permission allowed.' : 'Permission denied.',
+    })
   }
 
   function broadcast(message: ServerMessage): void {
     for (const client of clients) send(client, message)
   }
 
+  function settlePermission(id: string, pending: PendingPermission, result: PermissionResult): void {
+    if (pendingPermissions.get(id) !== pending) return
+    pendingPermissions.delete(id)
+    pending.settle(result)
+  }
+
   async function close(): Promise<void> {
     clearInterval(maintenanceTimer)
-    for (const client of clients) client.terminate()
+    for (const [id, pending] of pendingPermissions) settlePermission(id, pending, 'cancelled')
+    for (const client of connections) client.terminate()
     webSockets.close()
     if (!server.listening) return
     await new Promise<void>((resolve, reject) => {
@@ -384,7 +473,7 @@ export function createBridgeServer(config: BridgeConfig, dependencies: BridgeDep
         })
       }),
     close,
-    address: () => `http://${config.host}:${config.port}`,
+    address: () => `${config.tlsCertPath ? 'https' : 'http'}://${config.host}:${config.port}`,
   }
 }
 
@@ -410,12 +499,13 @@ function rawDataToBuffer(data: RawData): Buffer {
   return Buffer.from(data.buffer, data.byteOffset, data.byteLength)
 }
 
-function hasTarget(target: CmuxTarget | undefined): target is CmuxTarget {
-  return Boolean(target?.surfaceId || target?.workspaceId)
+function isHookPath(pathname: string): boolean {
+  return pathname === '/hooks/permission' || pathname === '/hooks/claude'
 }
 
-function isHookPath(pathname: string): boolean {
-  return pathname === '/hooks/permission' || pathname === '/hooks/claude' || pathname === '/hooks/cmux'
+function permissionExpired(request: PermissionRequest, now: number, ttlMs: number): boolean {
+  const createdAt = Date.parse(request.createdAt)
+  return !Number.isFinite(createdAt) || now - createdAt > ttlMs
 }
 
 function requestIsAuthorized(request: IncomingMessage, token: string): boolean {

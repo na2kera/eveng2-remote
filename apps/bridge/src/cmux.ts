@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import type { CmuxTarget, PermissionDecision } from '@eveng2-remote/protocol'
+import type { CmuxTarget } from '@eveng2-remote/protocol'
 
 const execFileAsync = promisify(execFile)
 
@@ -8,12 +8,9 @@ export interface CmuxOptions {
   binary: string
   defaultSurface?: string
   defaultWorkspace?: string
-  allowInput: string
-  denyInput: string
 }
 
 export interface CmuxController {
-  respondToPermission(target: CmuxTarget, decision: PermissionDecision): Promise<void>
   sendText(target: CmuxTarget, text: string): Promise<void>
   resolveTarget(target?: CmuxTarget): CmuxTarget
 }
@@ -37,11 +34,6 @@ export class CmuxClient implements CmuxController {
       throw new Error('No cmux target is known. Include surfaceId in the hook or set CMUX_DEFAULT_SURFACE.')
     }
     return resolved
-  }
-
-  async respondToPermission(target: CmuxTarget, decision: PermissionDecision): Promise<void> {
-    const input = decision === 'allow' ? this.options.allowInput : this.options.denyInput
-    await this.run(this.options.binary, ['send', ...targetArgs(this.resolveTarget(target)), input])
   }
 
   async sendText(target: CmuxTarget, text: string): Promise<void> {

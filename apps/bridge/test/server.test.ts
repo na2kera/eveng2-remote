@@ -13,38 +13,21 @@ import type { CmuxController } from '../src/cmux.js'
 import type { BridgeConfig } from '../src/config.js'
 import { createBridgeServer } from '../src/server.js'
 
-const TOKEN = 'test-token-at-least-16-characters'
+const CLIENT_TOKEN = 'test-client-token-at-least-32-characters'
+const HOOK_TOKEN = 'test-hook-token-different-and-at-least-32-characters'
 
 test('runs permission and voice command flows end-to-end', async t => {
-  const permissionResponses: Array<{ target: CmuxTarget; decision: string }> = []
   const sentTexts: Array<{ target: CmuxTarget; text: string }> = []
   const cmux: CmuxController = {
     resolveTarget(target = {}) {
       if (!target.surfaceId && !target.workspaceId) throw new Error('target missing')
       return target
     },
-    async respondToPermission(target, decision) {
-      permissionResponses.push({ target, decision })
-    },
     async sendText(target, text) {
       sentTexts.push({ target, text })
     },
   }
-  const config: BridgeConfig = {
-    host: '127.0.0.1',
-    port: 0,
-    token: TOKEN,
-    whisperUrl: 'http://127.0.0.1:8080/inference',
-    whisperLanguage: 'ja',
-    whisperPrompt: '',
-    whisperTimeoutMs: 1_000,
-    maxRecordingBytes: 64_000,
-    cmuxBin: 'cmux',
-    cmuxAllowInput: 'y',
-    cmuxDenyInput: 'n',
-    permissionTtlMs: 60_000,
-    maxHookBodyBytes: 64 * 1024,
-  }
+  const config = createTestConfig()
   const runtime = createBridgeServer(config, {
     cmux,
     transcriber: { transcribe: async () => 'npm test を実行して' },
@@ -55,10 +38,22 @@ test('runs permission and voice command flows end-to-end', async t => {
 
   const address = runtime.server.address() as AddressInfo
   const baseUrl = `http://127.0.0.1:${address.port}`
-  const ws = new WebSocket(`ws://127.0.0.1:${address.port}/ws?token=${encodeURIComponent(TOKEN)}`)
+  const ws = new WebSocket(`ws://127.0.0.1:${address.port}/ws`)
   const inbox = createInbox(ws)
   t.after(() => ws.terminate())
 
+  await new Promise<void>((resolve, reject) => {
+    ws.once('open', resolve)
+    ws.once('error', reject)
+  })
+  ws.send(
+    encodeMessage({
+      type: 'client.hello',
+      protocolVersion: PROTOCOL_VERSION,
+      clientId: 'test-client',
+      token: CLIENT_TOKEN,
+    }),
+  )
   const hello = await inbox.next('server.hello')
   assert.equal(hello.protocolVersion, PROTOCOL_VERSION)
 
@@ -73,9 +68,28 @@ test('runs permission and voice command flows end-to-end', async t => {
   })
   assert.equal(unauthorized.status, 401)
 
-  const accepted = await fetch(`${baseUrl}/hooks/permission`, {
+  const clientCredentialRejected = await fetch(`${baseUrl}/hooks/permission`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${CLIENT_TOKEN}`, 'content-type': 'application/json' },
+    body: '{}',
+  })
+  assert.equal(clientCredentialRejected.status, 401)
+
+  const unauthenticatedWs = new WebSocket(
+    `ws://127.0.0.1:${address.port}/ws?token=${encodeURIComponent(CLIENT_TOKEN)}`,
+  )
+  const unauthenticatedInbox = createInbox(unauthenticatedWs)
+  t.after(() => unauthenticatedWs.terminate())
+  await new Promise<void>((resolve, reject) => {
+    unauthenticatedWs.once('open', resolve)
+    unauthenticatedWs.once('error', reject)
+  })
+  unauthenticatedWs.send(encodeMessage({ type: 'audio.start', sessionId: 'query-token-is-not-auth' }))
+  assert.equal((await unauthenticatedInbox.next('error')).code, 'hello_required')
+
+  const acceptedPromise = fetch(`${baseUrl}/hooks/permission`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${HOOK_TOKEN}`, 'content-type': 'application/json' },
     body: JSON.stringify({
       requestId: 'permission-1',
       toolName: 'Bash',
@@ -83,13 +97,12 @@ test('runs permission and voice command flows end-to-end', async t => {
       surfaceId: 'surface:7',
     }),
   })
-  assert.equal(accepted.status, 202)
   const request = await inbox.next('permission.request')
   assert.equal(request.request.id, 'permission-1')
 
   const duplicate = await fetch(`${baseUrl}/hooks/permission`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${HOOK_TOKEN}`, 'content-type': 'application/json' },
     body: JSON.stringify({ requestId: 'permission-1', toolName: 'Bash', surfaceId: 'surface:7' }),
   })
   assert.equal(duplicate.status, 409)
@@ -97,7 +110,9 @@ test('runs permission and voice command flows end-to-end', async t => {
   ws.send(encodeMessage({ type: 'permission.response', requestId: 'permission-1', decision: 'allow' }))
   const permissionDone = await inbox.next('action.completed')
   assert.equal(permissionDone.action, 'permission')
-  assert.deepEqual(permissionResponses, [{ target: { surfaceId: 'surface:7' }, decision: 'allow' }])
+  const accepted = await acceptedPromise
+  assert.equal(accepted.status, 200)
+  assert.deepEqual(await accepted.json(), { decision: 'allow', requestId: 'permission-1' })
 
   ws.send(encodeMessage({ type: 'audio.start', sessionId: 'audio-1' }))
   await inbox.next('audio.started')
@@ -139,6 +154,80 @@ test('runs permission and voice command flows end-to-end', async t => {
   assert.equal(retryDone.action, 'voice.retry')
   assert.equal(sentTexts.length, 1)
 })
+
+test('limits concurrent transcriptions', async t => {
+  let finishTranscription!: (text: string) => void
+  const transcription = new Promise<string>(resolve => {
+    finishTranscription = resolve
+  })
+  const cmux: CmuxController = {
+    resolveTarget(target = {}) {
+      return target.surfaceId || target.workspaceId ? target : { surfaceId: 'surface:default' }
+    },
+    async sendText() {},
+  }
+  const runtime = createBridgeServer(createTestConfig({ maxConcurrentTranscriptions: 1 }), {
+    cmux,
+    transcriber: { transcribe: async () => transcription },
+    log: { info() {}, warn() {}, error() {} },
+  })
+  await runtime.listen()
+  t.after(() => runtime.close())
+  const address = runtime.server.address() as AddressInfo
+  const first = await connectClient(address.port, 'first-client')
+  const second = await connectClient(address.port, 'second-client')
+  t.after(() => first.socket.terminate())
+  t.after(() => second.socket.terminate())
+
+  first.socket.send(encodeMessage({ type: 'audio.start', sessionId: 'first' }))
+  await first.inbox.next('audio.started')
+  first.socket.send(Buffer.alloc(3_200, 1))
+  first.socket.send(encodeMessage({ type: 'audio.stop', sessionId: 'first' }))
+  await first.inbox.next('transcription.started')
+
+  second.socket.send(encodeMessage({ type: 'audio.start', sessionId: 'second' }))
+  await second.inbox.next('audio.started')
+  second.socket.send(Buffer.alloc(3_200, 1))
+  second.socket.send(encodeMessage({ type: 'audio.stop', sessionId: 'second' }))
+  assert.equal((await second.inbox.next('error')).code, 'transcription_busy')
+
+  finishTranscription('done')
+  assert.equal((await first.inbox.next('transcript.result')).text, 'done')
+})
+
+function createTestConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
+  return {
+    host: '127.0.0.1',
+    port: 0,
+    clientToken: CLIENT_TOKEN,
+    hookToken: HOOK_TOKEN,
+    whisperUrl: 'http://127.0.0.1:8080/inference',
+    whisperLanguage: 'ja',
+    whisperPrompt: '',
+    whisperTimeoutMs: 1_000,
+    maxWhisperResponseBytes: 64 * 1024,
+    maxRecordingBytes: 64_000,
+    maxClients: 4,
+    maxPendingPermissions: 32,
+    maxConcurrentTranscriptions: 1,
+    cmuxBin: 'cmux',
+    permissionTtlMs: 60_000,
+    maxHookBodyBytes: 64 * 1024,
+    ...overrides,
+  }
+}
+
+async function connectClient(port: number, clientId: string) {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+  const inbox = createInbox(socket)
+  await new Promise<void>((resolve, reject) => {
+    socket.once('open', resolve)
+    socket.once('error', reject)
+  })
+  socket.send(encodeMessage({ type: 'client.hello', protocolVersion: PROTOCOL_VERSION, clientId, token: CLIENT_TOKEN }))
+  await inbox.next('server.hello')
+  return { socket, inbox }
+}
 
 function createInbox(socket: WebSocket) {
   const messages: ServerMessage[] = []

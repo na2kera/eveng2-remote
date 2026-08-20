@@ -9,6 +9,7 @@ export interface UiView {
   hint: string
   primary?: string
   secondary?: string
+  pairing?: boolean
 }
 
 export interface UiActions {
@@ -23,6 +24,8 @@ let bodyEl: HTMLParagraphElement
 let hintEl: HTMLParagraphElement
 let primaryButton: HTMLButtonElement
 let secondaryButton: HTMLButtonElement
+let pairingPanel: HTMLDivElement
+let pairingInput: HTMLInputElement
 
 export function mountUi(actions: UiActions): void {
   const app = document.querySelector<HTMLDivElement>('#app')
@@ -45,6 +48,10 @@ export function mountUi(actions: UiActions): void {
         <button id="primary" class="button button-primary" type="button"></button>
         <button id="secondary" class="button button-secondary" type="button"></button>
       </div>
+      <div id="pairing" class="pairing" hidden>
+        <label for="pairing-token">Client pairing token</label>
+        <input id="pairing-token" type="password" autocomplete="off" spellcheck="false" />
+      </div>
       <footer><span>LOCAL CONTROL CHANNEL</span><span class="rule"></span><span>16 kHz PCM</span></footer>
     </main>
   `
@@ -56,6 +63,8 @@ export function mountUi(actions: UiActions): void {
   hintEl = requiredElement(app, '#hint')
   primaryButton = requiredElement(app, '#primary')
   secondaryButton = requiredElement(app, '#secondary')
+  pairingPanel = requiredElement(app, '#pairing')
+  pairingInput = requiredElement(app, '#pairing-token')
   primaryButton.addEventListener('click', actions.onPrimary)
   secondaryButton.addEventListener('click', actions.onSecondary)
   injectStyles()
@@ -70,6 +79,12 @@ export function renderUi(view: UiView): void {
   hintEl.textContent = view.hint
   setButton(primaryButton, view.primary)
   setButton(secondaryButton, view.secondary)
+  pairingPanel.hidden = !view.pairing
+  if (view.pairing) pairingInput.focus()
+}
+
+export function pairingTokenValue(): string {
+  return pairingInput.value.trim()
 }
 
 function setButton(button: HTMLButtonElement, label: string | undefined): void {
@@ -125,7 +140,7 @@ function injectStyles(): void {
     .signal-live, .signal-success { color: var(--signal); border-color: rgba(128,255,138,.55); }
     .signal-warning { color: var(--amber); border-color: rgba(246,201,92,.55); }
     .signal-danger { color: var(--red); border-color: rgba(255,120,111,.55); }
-    .console { position: relative; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; min-height: 300px; padding: clamp(28px, 7vw, 58px); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(255,255,255,.025), transparent 38%), var(--panel); box-shadow: inset 0 0 0 7px var(--ground), 0 24px 70px rgba(0,0,0,.28); }
+    .console { position: relative; overflow: auto; display: flex; flex-direction: column; justify-content: flex-end; min-height: 300px; padding: clamp(28px, 7vw, 58px); border: 1px solid var(--line); background: linear-gradient(145deg, rgba(255,255,255,.025), transparent 38%), var(--panel); box-shadow: inset 0 0 0 7px var(--ground), 0 24px 70px rgba(0,0,0,.28); }
     .console::before { content: ""; position: absolute; inset: 7px; border: 1px solid rgba(128,255,138,.08); pointer-events: none; }
     .scanline { position: absolute; left: 8px; right: 8px; height: 1px; top: 8px; background: linear-gradient(90deg, transparent, rgba(128,255,138,.5), transparent); animation: scan 6s linear infinite; opacity: .45; }
     .index { position: absolute; top: 30px; right: 30px; color: #536057; font: 600 10px/1 "SF Mono", Menlo, monospace; letter-spacing: .15em; }
@@ -134,6 +149,10 @@ function injectStyles(): void {
     .body { max-width: 590px; min-height: 3em; margin: 22px 0 0; color: #b8c1ba; font: 500 16px/1.55 "SF Mono", Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
     .hint { margin: 28px 0 0; color: var(--muted); font: 600 11px/1.4 "SF Mono", Menlo, monospace; letter-spacing: .07em; text-transform: uppercase; }
     .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .pairing { display: grid; gap: 8px; }
+    .pairing[hidden] { display: none; }
+    .pairing label { color: var(--muted); font: 600 11px/1.4 "SF Mono", Menlo, monospace; letter-spacing: .07em; text-transform: uppercase; }
+    .pairing input { min-height: 48px; border: 1px solid var(--line); border-radius: 0; padding: 10px 12px; background: var(--panel); color: var(--ink); font: 500 14px/1.4 "SF Mono", Menlo, monospace; }
     .button { min-height: 54px; border-radius: 0; border: 1px solid var(--line); font: 700 12px/1 "SF Mono", Menlo, monospace; letter-spacing: .14em; text-transform: uppercase; transition: transform 120ms ease, background 120ms ease; }
     .button:active { transform: translateY(2px); }
     .button-primary { background: var(--signal); border-color: var(--signal); color: #081009; }
